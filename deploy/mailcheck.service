@@ -1,0 +1,12 @@
+[Unit]
+Description=Service to check mail dns records
+After=network.target
+
+[Service]
+User=johan
+WorkingDirectory=/home/johan/mail-auth-checker
+ExecStart=/home/johan/mail-auth-checker/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
