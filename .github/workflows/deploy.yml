@@ -1,0 +1,112 @@
+name: Build and Deploy
+
+# Runs on every push to main, and can be triggered by hand from the Actions tab.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Permissions granted to the token this workflow runs with. Least privilege:
+# nothing here is on by default.
+permissions:
+  contents: read   # check out the repo
+  packages: write  # push the image to ghcr.io
+  id-token: write  # REQUIRED for OIDC. Without this, Azure login fails.
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: mail-auth-checker
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Build the container image and push it to GitHub Container Registry.
+  # ---------------------------------------------------------------------
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      # Expose the fully qualified image reference to the deploy job.
+      image: ${{ steps.meta.outputs.image }}
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Compute image reference
+        id: meta
+        # Registry paths must be lowercase. Tag with the commit SHA so every
+        # deployment maps to exactly one commit, rather than a moving "latest".
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "image=${REGISTRY}/${OWNER}/${IMAGE_NAME}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "latest=${REGISTRY}/${OWNER}/${IMAGE_NAME}:latest" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # Automatically provided by Actions. Scoped to this repo and run.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}
+            ${{ steps.meta.outputs.latest }}
+          # Reuse layer cache between runs so rebuilds do not start from zero.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------
+  # Deploy the freshly built image with Terraform.
+  # ---------------------------------------------------------------------
+  deploy:
+    needs: build          # wait for build, and only run if it succeeded
+    runs-on: ubuntu-latest
+
+    # The azurerm provider reads these. ARM_USE_OIDC tells it to exchange the
+    # GitHub-issued token for an Azure token instead of looking for a secret.
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: true
+
+    defaults:
+      run:
+        working-directory: terraform   # run every step in the terraform folder
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false   # keep raw output readable in logs
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive
+
+      - name: Initialize (connects to remote state)
+        run: terraform init
+
+      - name: Validate configuration
+        run: terraform validate
+
+      - name: Plan
+        run: terraform plan -input=false -var="container_image=${{ needs.build.outputs.image }}"
+
+      - name: Apply
+        # -auto-approve because nobody is present to type "yes".
+        # -input=false makes it fail rather than hang if a value is missing.
+        run: terraform apply -auto-approve -input=false -var="container_image=${{ needs.build.outputs.image }}"
+
+      - name: Show the deployed URL
+        run: terraform output -raw app_url && echo
